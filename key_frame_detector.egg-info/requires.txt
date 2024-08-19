@@ -1,0 +1,6 @@
+opencv-python
+numpy
+peakutils
+matplotlib
+ffmpeg-python
+ffprobe-python
