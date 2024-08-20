@@ -1,150 +1,202 @@
 import os
 import numpy as np
-import time
-import peakutils
-import ffmpeg
-from ffprobe import FFProbe
+import av
+import json
+from scipy.interpolate import griddata
 from KeyFrameDetector.utils import convert_frame_to_grayscale, save_keyframe
+from collections import deque
 
-def create_frame_reader(video_path, chunk_size=1000, start_time=None, end_time=None):
-    metadata = FFProbe(video_path)
-    video_stream = next(s for s in metadata.streams if s.is_video())
-    width = int(video_stream.width)
-    height = int(video_stream.height)
-    fps = eval(video_stream.r_frame_rate)
-    
-    input_args = {'ss': start_time} if start_time else {}
-    output_args = {'t': end_time} if end_time else {}
-    
-    stream = ffmpeg.input(video_path, **input_args)
-    
-    if start_time:
-        stream = stream.filter('setpts', 'PTS-STARTPTS')
-    
-    process = (
-        stream
-        .output('pipe:', format='rawvideo', pix_fmt='rgb24', **output_args)
-        .run_async(pipe_stdout=True)
-    )
-    
-    frame_size = width * height * 3
-    
-    def read_frames():
-        while True:
-            in_bytes = process.stdout.read(frame_size * chunk_size)
-            if not in_bytes:
-                break
-            yield np.frombuffer(in_bytes, np.uint8).reshape([-1, height, width, 3])
-    
-    return read_frames, process, fps
-
-def original_keyframe_detection(video_path, dest, threshold, chunk_size=1000, start_time=None, end_time=None):
-    frame_reader, process, fps = create_frame_reader(video_path, chunk_size, start_time, end_time)
-    
-    keyframePath = os.path.join(dest, 'keyFrames')
-    os.makedirs(keyframePath, exist_ok=True)
-    
-    lstfrm = []
-    lstdiffMag = []
-    frames = []
-    
+def analyze_video_motion_vectors(video_path, sample_duration=10):
     try:
-        frame_count = 0
-        last_frame_gray = None
-        for chunk in frame_reader():
-            frames.extend(chunk)
-            for frame in chunk:
-                gray_frame = convert_frame_to_grayscale(frame)
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            start_time = float(stream.start_time or 0)
+            
+            # Handle cases where duration is not available
+            if stream.duration is not None:
+                duration = float(stream.duration * stream.time_base)
+            else:
+                # If duration is not available, we'll analyze the first 'sample_duration' seconds
+                duration = sample_duration
+            
+            container.seek(int(start_time * stream.time_base))
+            
+            frames_with_mv = 0
+            total_frames = 0
+            
+            for frame in container.decode(video=0):
+                if frame.time > start_time + sample_duration:
+                    break
                 
-                if last_frame_gray is not None:
-                    diff = np.mean(np.abs(gray_frame.astype(int) - last_frame_gray.astype(int)))
-                    lstdiffMag.append(diff)
-                    lstfrm.append(frame_count)
+                total_frames += 1
+                if hasattr(frame, 'motion_vectors') and frame.motion_vectors:
+                    frames_with_mv += 1
+            
+            has_motion_vectors = frames_with_mv > 0
+            percentage_with_mv = (frames_with_mv / total_frames) * 100 if total_frames > 0 else 0
+            
+            return has_motion_vectors, percentage_with_mv
+    except Exception as e:
+        print(f"Error analyzing video motion vectors: {str(e)}")
+        return False, 0
+
+def enhance_motion_vectors(mv_array, frame_shape):
+    y, x = np.mgrid[0:frame_shape[0], 0:frame_shape[1]]
+    src_points = mv_array[:, 0]
+    dst_x = griddata(src_points, mv_array[:, 1], (y, x), method='linear', fill_value=0)
+    dst_y = griddata(src_points, mv_array[:, 2], (y, x), method='linear', fill_value=0)
+    return np.stack([dst_x, dst_y], axis=-1)
+
+def compute_frame_difference(prev_frame, curr_frame):
+    return np.mean(np.abs(curr_frame.astype(float) - prev_frame.astype(float)))
+
+def lightweight_optical_flow(video_path, use_motion_vectors=True):
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        previous_frame = None
+        previous_flow = None
+        
+        for frame in container.decode(video=0):
+            current_frame = frame.to_ndarray(format='gray')
+            
+            if use_motion_vectors and hasattr(frame, 'motion_vectors') and frame.motion_vectors:
+                mv_array = np.array([(mv.source, mv.dst_x, mv.dst_y) for mv in frame.motion_vectors])
+                flow = enhance_motion_vectors(mv_array, current_frame.shape)
                 
-                last_frame_gray = gray_frame
-                frame_count += 1
-        
-        y = np.array(lstdiffMag)
-        base = peakutils.baseline(y, 2)
-        indices = peakutils.indexes(y-base, threshold, min_dist=1)
-        
-        for idx in indices:
-            save_keyframe(frames[idx], keyframePath, idx)
-            print(f"Keyframe detected at {lstfrm[idx] / fps:.2f} seconds")
-    
-    finally:
-        process.stdout.close()
-        process.wait()
+                if previous_flow is not None:
+                    flow = 0.5 * flow + 0.5 * previous_flow
+                
+                previous_flow = flow
+                yield frame.time, np.sqrt(np.sum(flow**2, axis=-1)).mean()
+            elif previous_frame is not None:
+                diff = compute_frame_difference(previous_frame, current_frame)
+                yield frame.time, diff
+            else:
+                yield frame.time, 0
+            
+            previous_frame = current_frame
 
 def keyframe_detection(video_path, dest, threshold, chunk_size=1000, start_time=None, end_time=None,
-                       min_scene_length=1, max_motion_factor=1.0, content_weight=1.0, use_original_algorithm=False):
-    if use_original_algorithm:
-        return original_keyframe_detection(video_path, dest, threshold, chunk_size, start_time, end_time)
-    frame_reader, process, fps = create_frame_reader(video_path, chunk_size, start_time, end_time)
-    
-    keyframePath = os.path.join(dest, 'keyFrames')
-    os.makedirs(keyframePath, exist_ok=True)
-    
-    last_keyframe_time = -float('inf')
-    last_frame_gray = None
-    frame_diffs = []
-    
+                       min_scene_length=1, max_motion_factor=1.0, content_weight=1.0, use_original_algorithm=False,
+                       min_time_constraint=None, max_time_constraint=None, look_ahead_time=1.0,
+                       verbose=False, text_mode=False, save_images=True, json_filename=None, debug_mode=False):
     try:
-        frame_count = 0
-        for chunk in frame_reader():
-            for frame in chunk:
-                frame_time = frame_count / fps
-                if end_time and frame_time > end_time:
-                    return
-                
-                is_keyframe, last_frame_gray, frame_diff = process_frame(
-                    frame, last_frame_gray, threshold, frame_time, last_keyframe_time,
-                    min_scene_length, max_motion_factor, content_weight, fps
-                )
-                
-                frame_diffs.append(frame_diff)
-                
-                if is_keyframe:
-                    save_keyframe(frame, keyframePath, frame_count)
-                    last_keyframe_time = frame_time
-                    print(f"Keyframe detected at {frame_time:.2f} seconds")
-                
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            fps = stream.average_rate
+            frame_count = 0
+            keyframe_data = []
+            magnitude_buffer = deque(maxlen=int(look_ahead_time * fps))
+            last_keyframe_time = -float('inf')
+
+            keyframePath = os.path.join(dest, 'keyFrames')
+            if save_images:
+                os.makedirs(keyframePath, exist_ok=True)
+
+            # Make frame 0 a keyframe
+            for frame in container.decode(video=0):
+                if save_images:
+                    save_keyframe(frame.to_ndarray(format='rgb24'), keyframePath, frame_count)
+                keyframe_info = {
+                    "time": 0.00,
+                    "frame": frame_count,
+                    "reason": "first frame"
+                }
+                if debug_mode:
+                    keyframe_info.update({
+                        "magnitude": 0,
+                        "adjusted_threshold": threshold,
+                        "time_since_last_keyframe": 0
+                    })
+                keyframe_data.append(keyframe_info)
+                if verbose:
+                    print(f"Keyframe detected at 0.00 seconds (first frame)")
+                last_keyframe_time = frame.time
+                prev_frame = convert_frame_to_grayscale(frame.to_ndarray(format='rgb24'))
+                break
+
+            for frame in container.decode(video=0):
                 frame_count += 1
-    finally:
-        process.stdout.close()
-        process.wait()
+                time = frame.time
 
-def process_frame(frame, last_frame_gray, base_threshold, frame_time, last_keyframe_time,
-                  min_scene_length, max_motion_factor, content_weight, fps):
-    gray_frame = convert_frame_to_grayscale(frame)
-    
-    if last_frame_gray is None:
-        return True, gray_frame, 0  # First frame is always a keyframe
-    
-    # Compute frame difference
-    frame_diff = np.mean(np.abs(gray_frame.astype(int) - last_frame_gray.astype(int)))
-    
-    # Apply tunable parameters
-    time_since_last_keyframe = frame_time - last_keyframe_time
-    motion_penalty = min(1.0, time_since_last_keyframe / min_scene_length)
-    content_boost = content_weight * (1 + np.std(gray_frame) / 128)  # Boost for high-contrast frames
-    
-    # Adjust threshold
-    adjusted_threshold = base_threshold * motion_penalty * max_motion_factor * content_boost
-    
-    is_keyframe = frame_diff > adjusted_threshold and time_since_last_keyframe >= min_scene_length
-    
-    return is_keyframe, gray_frame, frame_diff
+                if start_time and time < start_time:
+                    continue
+                if end_time and time > end_time:
+                    break
 
-def tune_keyframe_detection(sensitivity='balanced', content_type='general', min_scene_duration=1.0):
-    # Sensitivity presets with lower thresholds
+                curr_frame = convert_frame_to_grayscale(frame.to_ndarray(format='rgb24'))
+                magnitude = np.mean(np.abs(curr_frame.astype(float) - prev_frame.astype(float)))
+                magnitude_buffer.append((time, magnitude))
+
+                time_since_last_keyframe = time - last_keyframe_time
+                motion_penalty = min(1.0, time_since_last_keyframe / min_scene_length)
+                adjusted_threshold = threshold * motion_penalty * max_motion_factor * content_weight
+
+                is_keyframe = False
+                keyframe_reason = ""
+
+                # Check if current magnitude is a local maximum
+                if len(magnitude_buffer) == magnitude_buffer.maxlen:
+                    _, center_magnitude = magnitude_buffer[len(magnitude_buffer) // 2]
+                    if center_magnitude == max(m for _, m in magnitude_buffer):
+                        if center_magnitude > adjusted_threshold:
+                            if min_time_constraint is None or time_since_last_keyframe >= min_time_constraint:
+                                is_keyframe = True
+                                keyframe_reason = "local maximum"
+
+                # Force keyframe if max time constraint is reached
+                if not is_keyframe and max_time_constraint is not None and time_since_last_keyframe >= max_time_constraint:
+                    is_keyframe = True
+                    keyframe_reason = "max time constraint"
+
+                if is_keyframe:
+                    if save_images:
+                        save_keyframe(frame.to_ndarray(format='rgb24'), keyframePath, frame_count)
+
+                    keyframe_info = {
+                        "time": time,
+                        "frame": frame_count,
+                        "reason": keyframe_reason
+                    }
+                    if debug_mode:
+                        keyframe_info.update({
+                            "magnitude": magnitude,
+                            "adjusted_threshold": adjusted_threshold,
+                            "time_since_last_keyframe": time_since_last_keyframe
+                        })
+                    keyframe_data.append(keyframe_info)
+                    last_keyframe_time = time
+                    if verbose:
+                        print(f"Keyframe detected at {time:.2f} seconds ({keyframe_reason})")
+
+                prev_frame = curr_frame
+
+                if verbose and frame_count % 100 == 0:
+                    print(f"Processed frame {frame_count} at {time:.2f} seconds")
+
+            if verbose:
+                print(f"Total frames processed: {frame_count}")
+
+            # Write keyframe metadata to JSON file if text_mode is True
+            if text_mode:
+                json_path = os.path.join(dest, json_filename)
+                with open(json_path, 'w') as f:
+                    json.dump(keyframe_data, f, indent=2)
+                
+                if verbose:
+                    print(f"Keyframe metadata written to {json_path}")
+
+    except Exception as e:
+        print(f"Error during keyframe detection: {str(e)}")
+
+def tune_keyframe_detection(sensitivity='balanced', content_type='general', min_scene_duration=1.0,
+                            min_time_constraint=None, max_time_constraint=None, look_ahead_time=1.0):
     sensitivity_presets = {
         'low': {'threshold': 15, 'max_motion_factor': 1.5, 'content_weight': 0.8},
         'balanced': {'threshold': 10, 'max_motion_factor': 1.2, 'content_weight': 1.0},
         'high': {'threshold': 5, 'max_motion_factor': 1.0, 'content_weight': 1.2}
     }
     
-    # Content type adjustments
     content_type_adjustments = {
         'action': {'threshold_mult': 0.8, 'min_scene_length_mult': 0.5},
         'documentary': {'threshold_mult': 1.2, 'min_scene_length_mult': 1.5},
@@ -154,9 +206,14 @@ def tune_keyframe_detection(sensitivity='balanced', content_type='general', min_
     base_params = sensitivity_presets[sensitivity]
     content_adj = content_type_adjustments[content_type]
     
-    return {
+    params = {
         'threshold': base_params['threshold'] * content_adj['threshold_mult'],
         'min_scene_length': min_scene_duration * content_adj['min_scene_length_mult'],
         'max_motion_factor': base_params['max_motion_factor'],
-        'content_weight': base_params['content_weight']
+        'content_weight': base_params['content_weight'],
+        'min_time_constraint': min_time_constraint,
+        'max_time_constraint': max_time_constraint,
+        'look_ahead_time': look_ahead_time
     }
+    
+    return params
